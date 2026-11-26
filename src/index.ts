@@ -1,9 +1,11 @@
 import { type AssistantMessage, type AssistantMessageEventStream, type Context, type ImageContent, type Model, type SimpleStreamOptions, type TextContent, type Tool, type UserMessage } from "@earendil-works/pi-ai";
 import * as piAi from "@earendil-works/pi-ai";
-import { buildSessionContext, getAgentDir, keyHint, type ExtensionAPI, type ExtensionContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import { buildSessionContext, getAgentDir, type ExtensionAPI, type ExtensionContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+// Namespace import: `keyHint` left the package root in omp 19.2; reading it off the
+// namespace keeps the module loadable on hosts that have it and on hosts that don't.
+import * as codingAgent from "@earendil-works/pi-coding-agent";
 import { query, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/resources";
-import { Text } from "@earendil-works/pi-tui";
 import { createSession, deleteSession, openSession, repairToolPairing } from "cc-session-io";
 import { appendFileSync, mkdirSync, realpathSync, statSync } from "fs";
 import { dirname, join } from "path";
@@ -31,6 +33,47 @@ const newAssistantMessageEventStream: () => AssistantMessageEventStream =
 import { cwdForCall } from "./session-cwd.js";
 import { updateUsage, type SdkUsage } from "./usage.js";
 import { rateLimitResponse } from "./rate-limit.js";
+
+// --- Tool renderer helpers (omp 19.2 reactive TUI) ---
+
+/**
+ * Styled text as a renderer rows object. omp 19.2 renders `{ render(width) }` objects from
+ * `renderCall`/`renderResult` (the pi-tui `Text` component is gone); pi's `Component`
+ * contract is the same shape, so the object also satisfies pi.
+ */
+interface TextRows {
+	render(width: number): string[];
+	invalidate(): void;
+}
+
+type WrapFn = (text: string, width: number) => string[];
+
+/**
+ * ANSI-aware wrapping from omp's pi-tui, resolved lazily: that module exists only inside
+ * omp >= 19.2. Until it resolves, or on hosts without it (pi, the unit tests), each line is
+ * one row and the host truncates it to the width.
+ */
+let wrapText: WrapFn = text => text.split("\n");
+void import("@oh-my-pi/pi-tui/text/width").then(
+	(mod: { wrap?: WrapFn }) => {
+		if (typeof mod.wrap === "function") wrapText = mod.wrap;
+	},
+	() => debug("textRows: @oh-my-pi/pi-tui/text/width unavailable; rows are not wrapped"),
+);
+
+function textRows(text: string): TextRows {
+	return { render: width => wrapText(text, width), invalidate() {} };
+}
+
+/** "<key> to expand" for the tool-expand binding, on hosts with or without `keyHint`. */
+function expandHint(): string {
+	const api = codingAgent as Record<string, unknown>;
+	if (typeof api.keyHint === "function") return api.keyHint("app.tools.expand", "to expand") as string;
+	const keymap = typeof api.getKeybindings === "function" ? (api.getKeybindings() as { keysFor?(action: string): string[] }) : undefined;
+	const key = keymap?.keysFor?.("app.tools.expand")[0];
+	if (key && typeof api.formatKeyHint === "function") return `${api.formatKeyHint(key) as string} to expand`;
+	return "expand";
+}
 
 // --- Debug logging ---
 // CLAUDE_BRIDGE_DEBUG=1 enables debug logging to <agent dir>/claude-bridge.log
@@ -2513,12 +2556,12 @@ export default function (pi: ExtensionAPI) {
 				const lines = truncated.split("\n").slice(0, PREVIEW_MAX_LINES);
 				text += theme.fg("muted", `"${lines.join("\n")}"`);
 				if (args.prompt.length > PREVIEW_MAX_CHARS || args.prompt.split("\n").length > PREVIEW_MAX_LINES) text += theme.fg("dim", " …");
-				return new Text(text, 0, 0);
+				return textRows(text);
 			},
 			renderResult(result, { expanded, isPartial }, theme) {
 				if (isPartial) {
 					const status = result.content[0]?.type === "text" ? result.content[0].text : "working...";
-					return new Text(theme.fg("mdLink", "◉ Claude Code ") + theme.fg("muted", status), 0, 0);
+					return textRows(theme.fg("mdLink", "◉ Claude Code ") + theme.fg("muted", status));
 				}
 
 				const details = result.details as { prompt?: string; executionTime?: number; actions?: string; error?: boolean } | undefined;
@@ -2539,11 +2582,11 @@ export default function (pi: ExtensionAPI) {
 					const truncated = body.length > PREVIEW_MAX_CHARS ? body.substring(0, PREVIEW_MAX_CHARS) : body;
 					const lines = truncated.split("\n").slice(0, PREVIEW_MAX_LINES);
 					if (lines.length) text += `\n${theme.fg("toolOutput", lines.join("\n"))}`;
-					if (body.length > PREVIEW_MAX_CHARS || body.split("\n").length > PREVIEW_MAX_LINES) text += `\n${theme.fg("dim", `… (${keyHint("app.tools.expand", "to expand")})`)}`;
+					if (body.length > PREVIEW_MAX_CHARS || body.split("\n").length > PREVIEW_MAX_LINES) text += `\n${theme.fg("dim", `… (${expandHint()})`)}`;
 
 				}
 
-				return new Text(text, 0, 0);
+				return textRows(text);
 			},
 			async execute(_id, params, signal, onUpdate, ctx) {
 				// Guard: circular delegation
